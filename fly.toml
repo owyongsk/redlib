@@ -1,11 +1,13 @@
-app = "replace-this-name" # Your free redlib instance will be at https://replace-this-name.fly.dev
+app = "rddt" # Your free redlib instance will be at https://replace-this-name.fly.dev
 primary_region = "sea" # Choose a region closest to you, see https://fly.io/docs/reference/regions/
 
 [build]
-image = "quay.io/redlib/redlib:latest"
+dockerfile = "Dockerfile.alpine"
 
 [env]
 REDLIB_DEFAULT_THEME = "dark" # Add more env variables here
+REDLIB_ENABLE_RSS = 'on'
+REDLIB_SHOW_NSFW = 'on'
 
 [http_service]
 auto_start_machines = true
