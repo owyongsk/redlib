@@ -15,8 +15,15 @@ use scraper::{ElementRef, Html, Node, Selector};
 use serde_json::{json as json_value, Value};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use wreq::RequestBuilder;
 
-const SVC_BASE: &str = "https://www.reddit.com/svc/shreddit";
+// Reddit also blocks these pages from datacenter IPs, so they can go through a
+// relay on a residential connection instead.
+static SVC_BASE: LazyLock<String> = LazyLock::new(|| {
+	let base = relay_setting("REDLIB_SCRAPE_RELAY").unwrap_or_else(|| "https://www.reddit.com".to_string());
+	format!("{}/svc/shreddit", base.trim_end_matches('/'))
+});
+static RELAY_SECRET: LazyLock<Option<String>> = LazyLock::new(|| relay_setting("REDLIB_SCRAPE_RELAY").and(relay_setting("REDLIB_SCRAPE_RELAY_SECRET")));
 
 static COMMENT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("shreddit-comment").unwrap());
 static MORE: LazyLock<Selector> = LazyLock::new(|| Selector::parse(r#"faceplate-partial[src*="/more-comments/"]"#).unwrap());
@@ -37,14 +44,14 @@ pub async fn thread(path: &str, quarantine: bool) -> Result<Value, String> {
 
 	let comments = if let Some(comment_id) = comment_id {
 		// The comment itself, then its replies through a cursor naming it as the parent
-		let mut html = get(&format!("{SVC_BASE}/comment/t1_{comment_id}?depth=0&subredditName={sub}"), quarantine).await?;
+		let mut html = get(&format!("{}/comment/t1_{comment_id}?depth=0&subredditName={sub}", *SVC_BASE), quarantine).await?;
 		html += &more(&sub, &id, &cursor_for(&comment_id), quarantine).await?;
 		html
 	} else if let Some(cursor) = param(path, "cursor") {
 		more(&sub, &id, &cursor, quarantine).await?
 	} else {
 		let sort = param(path, "sort").filter(|s| !s.is_empty()).unwrap_or_else(|| "confidence".to_string());
-		get(&format!("{SVC_BASE}/comments/r/{sub}/t3_{id}?sort={}", sort.to_uppercase()), quarantine).await?
+		get(&format!("{}/comments/r/{sub}/t3_{id}?sort={}", *SVC_BASE, sort.to_uppercase()), quarantine).await?
 	};
 
 	Ok(json_value!([post, listing(parse_comments(&comments, &id))]))
@@ -75,8 +82,23 @@ fn cookies(quarantine: bool) -> String {
 	cookies
 }
 
+// Read straight from the environment rather than `Config`, which /info.json publishes.
+fn relay_setting(name: &str) -> Option<String> {
+	std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn with_relay_secret(builder: RequestBuilder) -> RequestBuilder {
+	match RELAY_SECRET.as_deref() {
+		Some(secret) => builder.header("X-Relay-Secret", secret),
+		None => builder,
+	}
+}
+
 async fn get(url: &str, quarantine: bool) -> Result<String, String> {
-	let res = CLIENT.get(url).header("Cookie", cookies(quarantine)).send().await.map_err(|e| e.to_string())?;
+	let res = with_relay_secret(CLIENT.get(url).header("Cookie", cookies(quarantine)))
+		.send()
+		.await
+		.map_err(|e| e.to_string())?;
 	if !res.status().is_success() {
 		return Err(format!("Reddit returned {} for comments | {url}", res.status()));
 	}
@@ -85,18 +107,20 @@ async fn get(url: &str, quarantine: bool) -> Result<String, String> {
 
 /// Loads the comments behind a cursor, like reddit.com's "more replies" buttons.
 async fn more(sub: &str, id: &str, cursor: &str, quarantine: bool) -> Result<String, String> {
-	let url = format!("{SVC_BASE}/more-comments/{sub}/t3_{id}");
+	let url = format!("{}/more-comments/{sub}/t3_{id}", *SVC_BASE);
 	// Double-submit CSRF check: any token works as long as cookie and form match
 	let csrf = format!("{:032x}", fastrand::u128(..));
 	let body = serde_urlencoded::to_string([("cursor", cursor), ("csrf_token", &csrf)]).map_err(|e| e.to_string())?;
-	let res = CLIENT
-		.post(&url)
-		.header("Cookie", format!("{}; csrf_token={csrf}", cookies(quarantine)))
-		.header("Content-Type", "application/x-www-form-urlencoded")
-		.body(body)
-		.send()
-		.await
-		.map_err(|e| e.to_string())?;
+	let res = with_relay_secret(
+		CLIENT
+			.post(&url)
+			.header("Cookie", format!("{}; csrf_token={csrf}", cookies(quarantine)))
+			.header("Content-Type", "application/x-www-form-urlencoded")
+			.body(body),
+	)
+	.send()
+	.await
+	.map_err(|e| e.to_string())?;
 	if !res.status().is_success() {
 		return Err(format!("Reddit returned {} for more comments | {url}", res.status()));
 	}
