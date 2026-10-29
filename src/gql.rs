@@ -7,7 +7,10 @@
 
 use crate::client::{json, send, OAUTH_CLIENT};
 use crate::utils::{format_url, param};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+	engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+	Engine as _,
+};
 use cached::proc_macro::cached;
 use chrono::DateTime;
 use serde_json::{json as json_value, Value};
@@ -17,6 +20,10 @@ const GQL_URL: &str = "https://gql-fed.reddit.com/";
 // Android PostComments persisted operation; raw GraphQL queries are rejected.
 // https://github.com/Amqx/reddit-gql/blob/main/src/operations.ts
 const POST_COMMENTS_HASH: &str = "314f29c2494fd78c7844ef2c6b09acb4bef5b37ab50b4ddc01691d6d5c8433f8";
+// Reddit blocks r/all listings and lookups of several posts at once, so the
+// AllFeedSdui operation lists the IDs and each post is fetched on its own.
+const ALL_FEED_HASH: &str = "0e9c0045dd244e934efd0ea4fefc00cb0b4d91523e2f09c8af075856cb59b937";
+const ALL_FEED_MAX_PAGES: usize = 8;
 const COMMENT_COUNT: u32 = 200;
 const MAX_DEPTH: u32 = 10;
 
@@ -52,6 +59,85 @@ pub async fn thread(path: String, quarantine: bool) -> Result<Value, String> {
 	}
 	comments["data"]["sort"] = if sort == "best" { "confidence".into() } else { sort.into() };
 	Ok(json_value!([post, comments]))
+}
+
+pub fn is_all(path: &str) -> bool {
+	path.starts_with("/r/") && path.split(['/', '.', '?']).nth(2).is_some_and(|sub| sub.eq_ignore_ascii_case("all"))
+}
+
+/// Return an r/all Listing. A feed page holds about eight posts, and the
+/// newest ones can't be fetched yet, so pages are read until the listing is full.
+#[cached(size = 100, time = 30, result = true)]
+pub async fn all(path: String) -> Result<Value, String> {
+	let (sort, time) = feed_sort(&path)?;
+	let limit = param(&path, "limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(25).clamp(1, 100);
+	let mut after = param(&path, "after").filter(|a| valid_id(a.trim_start_matches("t3_"))).map(|a| STANDARD.encode(a));
+	let mut seen: Vec<String> = Vec::new();
+	let mut children = Vec::new();
+	for _ in 0..ALL_FEED_MAX_PAGES {
+		let mut variables = json_value!({ "sort": sort });
+		if let Some(time) = time {
+			variables["time"] = time.into();
+		}
+		if let Some(after) = &after {
+			variables["after"] = after.as_str().into();
+		}
+		let body = json_value!({
+		 "operationName": "AllFeedSdui", "variables": variables,
+		 "extensions": { "persistedQuery": { "version": 1, "sha256Hash": ALL_FEED_HASH } }
+		});
+		let response = query(&body).await?;
+		let elements = &response["data"]["allV3"]["elements"];
+		let mut tasks = Vec::new();
+		for node in elements["edges"].as_array().into_iter().flatten().map(|edge| &edge["node"]) {
+			let Some(id) = node["groupId"].as_str() else { continue };
+			let is_post = id.strip_prefix("t3_").is_some_and(valid_id);
+			if is_post && node["adPayload"].is_null() && !seen.iter().any(|i| i == id) {
+				seen.push(id.to_owned());
+				tasks.push(tokio::spawn(json(format!("/by_id/{id}.json?raw_json=1"), false)));
+			}
+		}
+		for task in tasks {
+			if let Ok(Ok(mut post)) = task.await {
+				if let Some(child) = post["data"]["children"].get_mut(0) {
+					children.push(child.take());
+				}
+			}
+		}
+		after = elements["pageInfo"]["endCursor"].as_str().filter(|c| !c.is_empty()).map(str::to_owned);
+		if children.len() >= limit || after.is_none() {
+			break;
+		}
+	}
+	let has_more = after.is_some() || children.len() > limit;
+	children.truncate(limit);
+	let next = children.last().and_then(|post| post["data"]["name"].as_str()).filter(|_| has_more).map(str::to_owned);
+	let mut listing = listing(children);
+	listing["data"]["after"] = next.into();
+	Ok(listing)
+}
+
+fn feed_sort(path: &str) -> Result<(&'static str, Option<&'static str>), String> {
+	let sort = path.split('?').next().and_then(|base| base.split('/').nth(3)).map_or("", |s| s.trim_end_matches(".json"));
+	let sort = match sort {
+		"" | "hot" => "HOT",
+		"new" => "NEW",
+		"top" => "TOP",
+		"rising" => "RISING",
+		"controversial" => "CONTROVERSIAL",
+		"best" => "BEST",
+		_ => return Err("Invalid sort".into()),
+	};
+	let time = match param(path, "t").as_deref() {
+		_ if sort != "TOP" && sort != "CONTROVERSIAL" => None,
+		Some("hour") => Some("HOUR"),
+		Some("week") => Some("WEEK"),
+		Some("month") => Some("MONTH"),
+		Some("year") => Some("YEAR"),
+		Some("all") => Some("ALL"),
+		_ => Some("DAY"),
+	};
+	Ok((sort, time))
 }
 
 fn sort_type(sort: &str) -> Option<&'static str> {
@@ -108,18 +194,18 @@ async fn query(body: &Value) -> Result<Value, String> {
 		let body = serde_json::to_vec(body).map_err(|e| e.to_string())?;
 		let response = send(Method::POST, GQL_URL, headers, Some(body))
 			.await
-			.map_err(|e| format!("Reddit comments request failed: {e}"))?;
+			.map_err(|e| format!("Reddit GraphQL request failed: {e}"))?;
 		let status = response.status();
 		if !status.is_success() {
-			return Err(format!("Reddit comments request returned {status}"));
+			return Err(format!("Reddit GraphQL request returned {status}"));
 		}
-		let response: Value = response.json().await.map_err(|_| "Reddit returned an invalid comments response")?;
+		let response: Value = response.json().await.map_err(|_| "Reddit returned an invalid GraphQL response")?;
 		// Upstream sometimes times out individual fields while returning HTTP 200.
 		if response["errors"].as_array().is_some_and(|errors| !errors.is_empty()) {
 			if attempt == 0 {
 				continue;
 			}
-			return Err(format!("Reddit comments API error: {}", response["errors"]));
+			return Err(format!("Reddit GraphQL error: {}", response["errors"]));
 		}
 		return Ok(response);
 	}
@@ -435,6 +521,19 @@ fn table(node: &Value, media: &Value) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn all_feed_paths_map_to_graphql_sorts() {
+		assert!(is_all("/r/all/hot.json?&raw_json=1"));
+		assert!(is_all("/r/All.json"));
+		assert!(!is_all("/r/allthingsrust/hot.json"));
+		assert!(!is_all("/r/all+rust/hot.json"));
+		assert_eq!(feed_sort("/r/all/hot.json?&raw_json=1").unwrap(), ("HOT", None));
+		assert_eq!(feed_sort("/r/all.json").unwrap(), ("HOT", None));
+		assert_eq!(feed_sort("/r/all/top.json?t=week").unwrap(), ("TOP", Some("WEEK")));
+		assert_eq!(feed_sort("/r/all/new.json?t=week").unwrap(), ("NEW", None));
+		assert!(feed_sort("/r/all/bogus.json").is_err());
+	}
 
 	#[test]
 	fn post_paths_do_not_confuse_titles_or_queries_with_ids() {

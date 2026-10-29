@@ -355,7 +355,12 @@ impl Post {
 	/// Fetch posts of a user or subreddit and return a vector of posts and the "after" value
 	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {
 		// Send a request to the url
-		let res = match json(path.to_string(), quarantine).await {
+		let res = if crate::gql::is_all(path) {
+			crate::gql::all(path.to_string()).await
+		} else {
+			json(path.to_string(), quarantine).await
+		};
+		let res = match res {
 			// If success, receive JSON in response
 			Ok(response) => response,
 			// If the Reddit API returns an error, exit this function

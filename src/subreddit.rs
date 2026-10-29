@@ -611,7 +611,14 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subreddit_link: String = format!("{}/r/{sub}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default());
 
 	// Get subreddit data
-	let subreddit = subreddit(&sub, false).await?;
+	let subreddit = if sub.eq_ignore_ascii_case("all") {
+		Subreddit {
+			title: "r/all".into(),
+			..Subreddit::default()
+		}
+	} else {
+		subreddit(&sub, false).await?
+	};
 
 	// Get posts
 	let (posts, _) = Post::fetch(&path, false).await?;
