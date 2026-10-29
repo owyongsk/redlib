@@ -7,6 +7,7 @@ dockerfile = "Dockerfile.alpine"
 [env]
 REDLIB_DEFAULT_THEME = "dark" # Add more env variables here
 REDLIB_ENABLE_RSS = 'on'
+REDLIB_FULL_URL = 'https://rddt.fly.dev'
 REDLIB_SHOW_NSFW = 'on'
 
 [http_service]

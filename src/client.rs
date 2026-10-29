@@ -1,5 +1,6 @@
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
+use crate::relay;
 use crate::server::RequestExt;
 use crate::utils::{format_url, param, Post};
 use arc_swap::ArcSwap;
@@ -267,19 +268,19 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	// Keep the logical path unchanged for caches and diagnostics. Reddit blocks
 	// literal anonymous comments routes, so only rewrite the outgoing URL.
 	let transport_path = comments_transport_path(&path);
-	let url = format!("{base_path}{transport_path}");
+	let url = relay::url(base_path, &transport_path);
 
-	let mut headers: Vec<(String, String)> = vec![
-		("Host".into(), host.into()),
-		(
-			"Cookie".into(),
-			if quarantine {
-				"_options=%7B%22pref_quarantine_optin%22%3A%20true%2C%20%22pref_gated_sr_optin%22%3A%20true%7D".into()
-			} else {
-				"".into()
-			},
-		),
-	];
+	let mut headers: Vec<(String, String)> = vec![(
+		"Cookie".into(),
+		if quarantine {
+			"_options=%7B%22pref_quarantine_optin%22%3A%20true%2C%20%22pref_gated_sr_optin%22%3A%20true%7D".into()
+		} else {
+			"".into()
+		},
+	)];
+	if !relay::enabled() {
+		headers.push(("Host".into(), host.into()));
+	}
 
 	{
 		let client = OAUTH_CLIENT.load_full();
@@ -291,7 +292,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
 	fastrand::shuffle(&mut headers);
 
-	let mut builder = CLIENT.request(method.clone(), &url);
+	let mut builder = relay::sign(CLIENT.request(method.clone(), &url));
 
 	for (key, value) in headers {
 		builder = builder.header(key, value);
