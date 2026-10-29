@@ -1,4 +1,5 @@
 #![allow(clippy::cmp_owned)]
+use crate::client::json;
 use crate::config::get_setting;
 use crate::server::RequestExt;
 use crate::subreddit::{can_access_quarantine, quarantine};
@@ -7,6 +8,7 @@ use crate::utils::{
 };
 use askama::Template;
 use hyper::{Body, Request, Response};
+use log::warn;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -57,7 +59,14 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	let highlighted_comment = &req.param("comment_id").unwrap_or_default();
 
 	// Send a request to the url, receive JSON in response
-	match crate::gql::thread(path, quarantined).await {
+	let response = match crate::gql::thread(path.clone(), quarantined).await {
+		Ok(response) => Ok(response),
+		Err(e) => {
+			warn!("GraphQL comments failed, falling back to the comments API: {e}");
+			json(path, quarantined).await
+		}
+	};
+	match response {
 		// Otherwise, grab the JSON output from the request
 		Ok(response) => {
 			// Parse the JSON into Post and Comment structs

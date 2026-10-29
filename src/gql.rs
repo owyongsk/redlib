@@ -5,13 +5,13 @@
 //! https://github.com/polak14/redlib/commit/a63460b4ac29c27401e3e2aaab34b68dca02991e
 //! The RTJSON renderer and comment conversion retain that implementation's design.
 
-use crate::client::{json, CLIENT, OAUTH_CLIENT};
+use crate::client::{json, send, OAUTH_CLIENT};
 use crate::utils::{format_url, param};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cached::proc_macro::cached;
 use chrono::DateTime;
 use serde_json::{json as json_value, Value};
-use std::time::Duration;
+use wreq::Method;
 
 const GQL_URL: &str = "https://gql-fed.reddit.com/";
 // Android PostComments persisted operation; raw GraphQL queries are rejected.
@@ -97,13 +97,18 @@ fn variables(id: &str, comment_id: Option<&str>, path: &str, sort: &str) -> Resu
 
 async fn query(body: &Value) -> Result<Value, String> {
 	for attempt in 0..2 {
-		let mut builder = CLIENT.post(GQL_URL).timeout(Duration::from_secs(20));
-		for (key, value) in &OAUTH_CLIENT.load_full().headers_map {
-			if !key.eq_ignore_ascii_case("content-type") {
-				builder = builder.header(key, value);
-			}
-		}
-		let response = builder.json(body).send().await.map_err(|e| format!("Reddit comments request failed: {e}"))?;
+		let mut headers: Vec<(String, String)> = OAUTH_CLIENT
+			.load_full()
+			.headers_map
+			.iter()
+			.filter(|(key, _)| !key.eq_ignore_ascii_case("content-type"))
+			.map(|(key, value)| (key.clone(), value.clone()))
+			.collect();
+		headers.push(("Content-Type".into(), "application/json".into()));
+		let body = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+		let response = send(Method::POST, GQL_URL, headers, Some(body))
+			.await
+			.map_err(|e| format!("Reddit comments request failed: {e}"))?;
 		let status = response.status();
 		if !status.is_success() {
 			return Err(format!("Reddit comments request returned {status}"));

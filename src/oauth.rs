@@ -1,7 +1,6 @@
 use crate::{
-	client::{CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
+	client::{send, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
-	relay,
 };
 use base64::{engine::general_purpose, Engine as _};
 use log::{error, info, trace, warn};
@@ -9,6 +8,7 @@ use serde_json::json;
 use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
 use tegen::tegen::TextGenerator;
 use tokio::time::{error::Elapsed, timeout};
+use wreq::Method;
 
 const REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
 
@@ -88,6 +88,7 @@ impl Oauth {
 						"[⛔] Failed to create OAuth client: {}. Retrying in 5 seconds...",
 						match e {
 							AuthError::Wreq(error) => error.to_string(),
+							AuthError::Request(error) => error.clone(),
 							AuthError::SerdeDeserialize(error) => error.to_string(),
 							AuthError::Field((value, error)) => format!("{error}\n{value}"),
 						}
@@ -142,6 +143,7 @@ impl Oauth {
 #[derive(Debug)]
 enum AuthError {
 	Wreq(wreq::Error),
+	Request(String),
 	SerdeDeserialize(serde_json::Error),
 	Field((serde_json::Value, &'static str)),
 }
@@ -149,6 +151,12 @@ enum AuthError {
 impl From<wreq::Error> for AuthError {
 	fn from(err: wreq::Error) -> Self {
 		AuthError::Wreq(err)
+	}
+}
+
+impl From<String> for AuthError {
+	fn from(err: String) -> Self {
+		AuthError::Request(err)
 	}
 }
 
@@ -220,19 +228,16 @@ impl MobileSpoofAuth {
 impl OauthBackend for MobileSpoofAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
-		let url = relay::url(AUTH_ENDPOINT, "/auth/v2/oauth/access-token/loid");
-		let mut builder = relay::sign(CLIENT.post(&url));
+		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
 
 		// Add headers from spoofed client
-		for (key, value) in &self.device.initial_headers {
-			builder = builder.header(key, value);
-		}
+		let mut headers: Vec<(String, String)> = self.device.initial_headers.clone().into_iter().collect();
 		// Set up HTTP Basic Auth - basically just the const OAuth ID's with no password,
 		// Base64-encoded. https://en.wikipedia.org/wiki/Basic_access_authentication
 		// This could be constant, but I don't think it's worth it. OAuth ID's can change
 		// over time and we want to be flexible.
 		let auth = general_purpose::STANDARD.encode(format!("{}:", self.device.oauth_id));
-		builder = builder.header("Authorization", format!("Basic {auth}"));
+		headers.push(("Authorization".into(), format!("Basic {auth}")));
 
 		// Set JSON body. I couldn't tell you what this means. But that's what the client sends
 		let json = json!({
@@ -242,7 +247,7 @@ impl OauthBackend for MobileSpoofAuth {
 		trace!("Sending token request to {url}...");
 
 		// Send request
-		let resp = builder.json(&json).send().await?;
+		let resp = send(Method::POST, &url, headers, Some(serde_json::to_vec(&json)?)).await?;
 
 		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
 		trace!("OAuth headers: {:#?}", resp.headers());
@@ -335,21 +340,14 @@ impl GenericWebAuth {
 impl OauthBackend for GenericWebAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		// Construct URL for OAuth token
-		let url = relay::url(AUTH_ENDPOINT, "/api/v1/access_token");
-		let mut builder = relay::sign(CLIENT.post(&url));
+		let url = format!("{AUTH_ENDPOINT}/api/v1/access_token");
 
 		// Add minimal headers
-		if !relay::enabled() {
-			builder = builder.header("Host", "www.reddit.com");
-		}
-		builder = builder.header("User-Agent", &self.user_agent);
-		builder = builder.header("Accept", "*/*");
-		builder = builder.header("Accept-Language", "en-US,en;q=0.5");
-		// builder = builder.header("Accept-Encoding", "gzip, deflate, br, zstd");
-		builder = builder.header("Authorization", "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=");
-		builder = builder.header("Content-Type", "application/x-www-form-urlencoded");
-		builder = builder.header("Sec-GPC", "1");
-		builder = builder.header("Connection", "keep-alive");
+		let headers = vec![
+			("User-Agent".to_string(), self.user_agent.clone()),
+			("Authorization".to_string(), "Basic M1hmQkpXbGlIdnFBQ25YcmZJWWxMdzo=".to_string()),
+			("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()),
+		];
 
 		// Set up form body
 		let body_str = format!("grant_type=https%3A%2F%2Foauth.reddit.com%2Fgrants%2Finstalled_client&device_id={}", self.device_id);
@@ -357,7 +355,7 @@ impl OauthBackend for GenericWebAuth {
 		trace!("Sending GenericWebAuth token request to {url}...");
 
 		// Send request
-		let resp: wreq::Response = builder.body(body_str).send().await?;
+		let resp = send(Method::POST, &url, headers, Some(body_str.into_bytes())).await?;
 
 		trace!("Received response with status {} and length {:?}", resp.status(), resp.headers().get("content-length"));
 		trace!("GenericWebAuth headers: {:#?}", resp.headers());

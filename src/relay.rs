@@ -1,7 +1,7 @@
-// Reddit blocks requests from datacenter IPs, and from TLS fingerprints older
-// than wreq can imitate. A relay on a residential connection can make them
-// instead: requests go to `{REDLIB_RELAY_URL}/{reddit host}{path}` with
-// `REDLIB_RELAY_SECRET` in the X-Relay-Secret header.
+// Reddit blocks some requests from datacenter IPs. A relay on a residential
+// connection can make them instead: requests go to
+// `{REDLIB_RELAY_URL}/{reddit host}{path}` with `REDLIB_RELAY_SECRET` in the
+// X-Relay-Secret header.
 //
 // Read straight from the environment rather than `Config`, which /info.json publishes.
 
@@ -25,11 +25,10 @@ pub fn enabled() -> bool {
 	RELAY.is_some()
 }
 
-/// URL for `path` on `base`, an upstream such as `https://oauth.reddit.com`.
-pub fn url(base: &str, path: &str) -> String {
+pub fn url(url: &str) -> String {
 	match RELAY.as_ref() {
-		Some(relay) => format!("{}/{}{path}", relay.url, base.trim_start_matches("https://")),
-		None => format!("{base}{path}"),
+		Some(relay) => format!("{}/{}", relay.url, url.trim_start_matches("https://")),
+		None => url.to_string(),
 	}
 }
 

@@ -1,6 +1,8 @@
 # supported versions here: https://hub.docker.com/_/rust
 ARG RUST_BUILDER_VERSION=slim-bookworm
 ARG ALPINE_VERSION=3.23
+ARG CURL_IMPERSONATE_VERSION=v2.3.1
+ARG CURL_IMPERSONATE_SHA256=83524540f6691becc12094f152c2e1b80045d0f4d65e854cedc3ca29bc169ef8
 
 ########################
 ## builder image
@@ -8,10 +10,23 @@ ARG ALPINE_VERSION=3.23
 FROM ghcr.io/rust-cross/rust-musl-cross:x86_64-musl AS builder
 
 RUN apt-get update \
-    && apt-get -y install git cmake perl pkg-config libclang-dev \
+    && apt-get -y install git cmake perl pkg-config libclang-dev curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup target add x86_64-unknown-linux-musl
+
+# Reddit requests go through libcurl-impersonate, a shared library, so redlib
+# is linked dynamically against musl.
+ARG CURL_IMPERSONATE_VERSION
+ARG CURL_IMPERSONATE_SHA256
+RUN curl -fsSL -o /tmp/curl-impersonate.tar.gz \
+        "https://github.com/lexiforest/curl-impersonate/releases/download/${CURL_IMPERSONATE_VERSION}/libcurl-impersonate-${CURL_IMPERSONATE_VERSION}.x86_64-linux-musl.tar.gz" \
+    && echo "${CURL_IMPERSONATE_SHA256}  /tmp/curl-impersonate.tar.gz" | sha256sum -c - \
+    && mkdir -p /opt/curl-impersonate \
+    && tar -xzf /tmp/curl-impersonate.tar.gz -C /opt/curl-impersonate --wildcards 'libcurl-impersonate.so*' 'LICENSE*' \
+    && rm /tmp/curl-impersonate.tar.gz
+ENV CURL_IMPERSONATE_DIR=/opt/curl-impersonate
+ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 WORKDIR /redlib
 
@@ -30,6 +45,11 @@ RUN echo "finished building redlib!"
 ## release image
 ########################
 FROM alpine:${ALPINE_VERSION} AS release
+
+RUN apk add --no-cache libgcc
+
+COPY --from=builder /opt/curl-impersonate/libcurl-impersonate.so.4 /usr/local/lib/
+COPY --from=builder /opt/curl-impersonate/LICENSE* /usr/share/licenses/curl-impersonate/
 
 # Import redlib binary from builder
 COPY --from=builder /redlib/target/x86_64-unknown-linux-musl/release/redlib /usr/local/bin/redlib

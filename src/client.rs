@@ -1,4 +1,5 @@
 use crate::dbg_msg;
+use crate::impersonate;
 use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
 use crate::relay;
 use crate::server::RequestExt;
@@ -22,10 +23,8 @@ use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
 
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
-const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
 
 const REDDIT_SHORT_URL_BASE: &str = "https://redd.it";
-const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
@@ -47,10 +46,7 @@ pub static OAUTH_IS_ROLLING_OVER: AtomicBool = AtomicBool::new(false);
 static COMMENTS_API_BLOCKED_UNTIL: AtomicU64 = AtomicU64::new(0);
 const COMMENTS_API_RETRY_SECS: u64 = 3600;
 
-const URL_PAIRS: [(&str, &str); 2] = [
-	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
-	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
-];
+const SHORT_URL_BASES: [&str; 2] = [ALTERNATIVE_REDDIT_URL_BASE, REDDIT_SHORT_URL_BASE];
 
 #[derive(Debug)]
 struct RedditDnsResolver;
@@ -122,10 +118,10 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 
 	// for each URL pair, try the HEAD request
 	let res = {
-		// for url base and host in URL_PAIRS, try reddit_short_head(path.clone(), true, url_base, url_base_host) and if it succeeds, set res. else, res = None
+		// for each url base in SHORT_URL_BASES, try reddit_short_head(path.clone(), true, url_base) and if it succeeds, set res. else, res = None
 		let mut res = None;
-		for (url_base, url_base_host) in URL_PAIRS {
-			res = reddit_short_head(path.clone(), true, url_base, url_base_host).await.ok();
+		for url_base in SHORT_URL_BASES {
+			res = reddit_short_head(path.clone(), true, url_base).await.ok();
 			if let Some(res) = &res {
 				if !res.status().is_client_error() {
 					break;
@@ -247,12 +243,12 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE)
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
-fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::HEAD, path, false, quarantine, base_path, host)
+fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str) -> Boxed<Result<WreqResponse, String>> {
+	request(&Method::HEAD, path, false, quarantine, base_path)
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -264,11 +260,10 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// Makes a request to Reddit. If `redirect` is `true`, `request_with_redirect`
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
-fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str) -> Boxed<Result<WreqResponse, String>> {
 	// Keep the logical path unchanged for caches and diagnostics. Reddit blocks
 	// literal anonymous comments routes, so only rewrite the outgoing URL.
-	let transport_path = comments_transport_path(&path);
-	let url = relay::url(base_path, &transport_path);
+	let url = format!("{base_path}{}", comments_transport_path(&path));
 
 	let mut headers: Vec<(String, String)> = vec![(
 		"Cookie".into(),
@@ -278,9 +273,6 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 			"".into()
 		},
 	)];
-	if !relay::enabled() {
-		headers.push(("Host".into(), host.into()));
-	}
 
 	{
 		let client = OAUTH_CLIENT.load_full();
@@ -292,14 +284,8 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
 	fastrand::shuffle(&mut headers);
 
-	let mut builder = relay::sign(CLIENT.request(method.clone(), &url));
-
-	for (key, value) in headers {
-		builder = builder.header(key, value);
-	}
-
 	async move {
-		match builder.send().await {
+		match send(method.clone(), &url, headers, None).await {
 			Ok(response) => {
 				// Reddit may respond with a 3xx. Decide whether or not to
 				// redirect based on caller params.
@@ -338,7 +324,6 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 						true,
 						quarantine,
 						base_path,
-						host,
 					)
 					.await;
 				};
@@ -348,11 +333,41 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 			Err(e) => {
 				dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
 
-				Err(e.to_string())
+				Err(e)
 			}
 		}
 	}
 	.boxed()
+}
+
+/// Sends a request to Reddit through the relay if one is set, and otherwise
+/// with curl-impersonate.
+pub async fn send(method: Method, url: &str, headers: Vec<(String, String)>, body: Option<Vec<u8>>) -> Result<WreqResponse, String> {
+	let headers: Vec<_> = headers.into_iter().filter(|(name, value)| is_forwarded(name, value)).collect();
+	if relay::enabled() {
+		let mut builder = relay::sign(CLIENT.request(method, relay::url(url)));
+		for (name, value) in headers {
+			builder = builder.header(name, value);
+		}
+		if let Some(body) = body {
+			builder = builder.body(body);
+		}
+		return builder.send().await.map_err(|e| e.to_string());
+	}
+	let url = url.to_string();
+	tokio::task::spawn_blocking(move || impersonate::send(&method, &url, &headers, body.as_deref()))
+		.await
+		.map_err(|e| e.to_string())?
+}
+
+// Browser headers would contradict the impersonated Chrome, but the API
+// expects the spoofed Android app's own headers.
+fn is_forwarded(name: &str, value: &str) -> bool {
+	let name = name.to_ascii_lowercase();
+	!value.is_empty()
+		&& (matches!(name.as_str(), "authorization" | "cookie" | "content-type" | "client-vendor-id")
+			|| name.starts_with("x-reddit-")
+			|| (name == "user-agent" && value.starts_with("Reddit/")))
 }
 
 /// Encode one separator in comments API routes to avoid Reddit's anonymous

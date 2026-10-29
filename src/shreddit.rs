@@ -7,8 +7,7 @@
 // converted into the shape of the `/comments/` JSON response, so post.rs and the
 // templates work unchanged.
 
-use crate::client::{json, CLIENT};
-use crate::relay;
+use crate::client::{json, send};
 use crate::utils::{format_url, param};
 use chrono::DateTime;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -16,6 +15,7 @@ use scraper::{ElementRef, Html, Node, Selector};
 use serde_json::{json as json_value, Value};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use wreq::Method;
 
 const WWW_BASE: &str = "https://www.reddit.com";
 
@@ -77,11 +77,11 @@ fn cookies(quarantine: bool) -> String {
 }
 
 fn svc_url(path: &str) -> String {
-	relay::url(WWW_BASE, &format!("/svc/shreddit{path}"))
+	format!("{WWW_BASE}/svc/shreddit{path}")
 }
 
 async fn get(url: &str, quarantine: bool) -> Result<String, String> {
-	let res = relay::sign(CLIENT.get(url).header("Cookie", cookies(quarantine))).send().await.map_err(|e| e.to_string())?;
+	let res = send(Method::GET, url, vec![("Cookie".into(), cookies(quarantine))], None).await?;
 	if !res.status().is_success() {
 		return Err(format!("Reddit returned {} for comments | {url}", res.status()));
 	}
@@ -94,16 +94,11 @@ async fn more(sub: &str, id: &str, cursor: &str, quarantine: bool) -> Result<Str
 	// Double-submit CSRF check: any token works as long as cookie and form match
 	let csrf = format!("{:032x}", fastrand::u128(..));
 	let body = serde_urlencoded::to_string([("cursor", cursor), ("csrf_token", &csrf)]).map_err(|e| e.to_string())?;
-	let res = relay::sign(
-		CLIENT
-			.post(&url)
-			.header("Cookie", format!("{}; csrf_token={csrf}", cookies(quarantine)))
-			.header("Content-Type", "application/x-www-form-urlencoded")
-			.body(body),
-	)
-	.send()
-	.await
-	.map_err(|e| e.to_string())?;
+	let headers = vec![
+		("Cookie".into(), format!("{}; csrf_token={csrf}", cookies(quarantine))),
+		("Content-Type".into(), "application/x-www-form-urlencoded".into()),
+	];
+	let res = send(Method::POST, &url, headers, Some(body.into_bytes())).await?;
 	if !res.status().is_success() {
 		return Err(format!("Reddit returned {} for more comments | {url}", res.status()));
 	}

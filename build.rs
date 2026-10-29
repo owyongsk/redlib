@@ -8,6 +8,10 @@ use std::os::windows::process::ExitStatusExt;
 
 fn main() {
 	println!("cargo:rerun-if-changed=src/");
+	println!("cargo:rerun-if-env-changed=CURL_IMPERSONATE_DIR");
+	if let Ok(dir) = std::env::var("CURL_IMPERSONATE_DIR") {
+		println!("cargo:rustc-link-search=native={dir}");
+	}
 	let output = String::from_utf8(
 		Command::new("git")
 			.args(["rev-parse", "HEAD"])
