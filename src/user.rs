@@ -7,6 +7,7 @@ use askama::Template;
 use chrono::DateTime;
 use htmlescape::decode_html;
 use hyper::{Body, Request, Response};
+use serde_json::Value;
 use time::{macros::format_description, OffsetDateTime};
 
 // STRUCTS
@@ -105,31 +106,39 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 // USER
+/// Reddit blocks /user/{name}/about.json, so the profile comes from the
+/// user's profile subreddit, and karma and the join date from the account,
+/// whose ID is read from the user's latest post or comment.
 async fn user(name: &str) -> Result<User, String> {
-	// Build the Reddit JSON API path
-	let path: String = format!("/user/{name}/about.json?raw_json=1");
+	let profile = json(format!("/r/u_{name}/about.json?raw_json=1"), false).await?;
+	let about = |item| profile["data"][item].as_str().unwrap_or_default().to_string();
+	let account = account(name).await.unwrap_or_default();
 
-	// Send a request to the url
-	json(path, false).await.map(|res| {
-		// Grab creation date as unix timestamp
-		let created_unix = res["data"]["created"].as_f64().unwrap_or(0.0).round() as i64;
-		let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+	let created_unix = account["created_utc"].as_f64().or_else(|| profile["data"]["created_utc"].as_f64()).unwrap_or(0.0).round() as i64;
+	let created = OffsetDateTime::from_unix_timestamp(created_unix).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+	let karma = ["link_karma", "comment_karma"].iter().map(|k| account[k].as_i64().unwrap_or(0)).sum();
 
-		// Closure used to parse JSON from Reddit APIs
-		let about = |item| res["data"]["subreddit"][item].as_str().unwrap_or_default().to_string();
-
-		// Parse the JSON output into a User struct
-		User {
-			name: res["data"]["name"].as_str().unwrap_or(name).to_owned(),
-			title: about("title"),
-			icon: format_url(&about("icon_img")),
-			karma: res["data"]["total_karma"].as_i64().unwrap_or(0),
-			created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
-			banner: about("banner_img"),
-			description: about("public_description"),
-			nsfw: res["data"]["subreddit"]["over_18"].as_bool().unwrap_or_default(),
-		}
+	Ok(User {
+		name: account["name"].as_str().unwrap_or(name).to_owned(),
+		title: about("title"),
+		icon: format_url(&about("icon_img")),
+		karma,
+		created: created.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default(),
+		banner: about("banner_img"),
+		description: about("public_description"),
+		nsfw: profile["data"]["over18"].as_bool().unwrap_or_default(),
 	})
+}
+
+async fn account(name: &str) -> Result<Value, String> {
+	let overview = json(format!("/user/{name}/overview.json?limit=1&raw_json=1"), false).await?;
+	let id = overview["data"]["children"][0]["data"]["author_fullname"]
+		.as_str()
+		.filter(|id| id.strip_prefix("t2_").is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())))
+		.ok_or("No account ID")?
+		.to_owned();
+	let mut accounts = json(format!("/api/user_data_by_account_ids.json?ids={id}"), false).await?;
+	Ok(accounts[id.as_str()].take())
 }
 
 pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
