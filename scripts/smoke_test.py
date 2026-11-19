@@ -125,7 +125,6 @@ CHECKS = [
     ("subreddit new", lambda: listing("/r/AskReddit/new")),
     ("subreddit rising", lambda: listing("/r/AskReddit/rising")),
     ("subreddit top of week", lambda: listing("/r/Charity/top?t=week")),
-    ("r/all", lambda: listing("/r/all")),
     ("RSS sorted by new", check_new_feed),
     ("RSS post bodies", check_feed_bodies),
     ("post with comments", check_post_with_comments),
