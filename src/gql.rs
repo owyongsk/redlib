@@ -23,6 +23,9 @@ const POST_COMMENTS_HASH: &str = "314f29c2494fd78c7844ef2c6b09acb4bef5b37ab50b4d
 // Reddit blocks r/all listings and lookups of several posts at once, so the
 // AllFeedSdui operation lists the IDs and each post is fetched on its own.
 const ALL_FEED_HASH: &str = "0e9c0045dd244e934efd0ea4fefc00cb0b4d91523e2f09c8af075856cb59b937";
+// Reddit blocks the new and rising listings of a subreddit in the same way.
+const SUBREDDIT_FEED_HASH: &str = "97046e2a48050f10a507db354a8da60955ffccb586dcf63163bdfc6610d5cf7a";
+const SUBREDDIT_FEED_PAGE_SIZE: usize = 25;
 const ALL_FEED_MAX_PAGES: usize = 8;
 const COMMENT_COUNT: u32 = 200;
 const MAX_DEPTH: u32 = 10;
@@ -61,36 +64,59 @@ pub async fn thread(path: String, quarantine: bool) -> Result<Value, String> {
 	Ok(json_value!([post, comments]))
 }
 
-pub fn is_all(path: &str) -> bool {
-	path.starts_with("/r/") && path.split(['/', '.', '?']).nth(2).is_some_and(|sub| sub.eq_ignore_ascii_case("all"))
+fn listing_sub(path: &str) -> Option<&str> {
+	path.strip_prefix("/r/")?.split(['/', '.', '?']).next()
 }
 
-/// Return an r/all Listing. A feed page holds about eight posts, and the
-/// newest ones can't be fetched yet, so pages are read until the listing is full.
+/// Whether the listing at this path is read through a GraphQL feed:
+/// any r/all listing, or a single subreddit's new or rising listing.
+pub fn is_feed(path: &str) -> bool {
+	let Some(sub) = listing_sub(path) else { return false };
+	if sub.eq_ignore_ascii_case("all") {
+		return true;
+	}
+	let sort = path.split('?').next().and_then(|base| base.split('/').nth(3)).map(|s| s.trim_end_matches(".json"));
+	!sub.is_empty() && sub.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && matches!(sort, Some("new" | "rising"))
+}
+
+/// Return a Listing from a GraphQL feed. A feed page holds only a few posts,
+/// and the newest r/all posts can't be fetched yet, so pages are read until
+/// the listing is full.
 #[cached(size = 100, time = 30, result = true)]
-pub async fn all(path: String) -> Result<Value, String> {
+pub async fn feed(path: String) -> Result<Value, String> {
 	let (sort, time) = feed_sort(&path)?;
+	let sub = listing_sub(&path).unwrap_or_default();
+	let is_all = sub.eq_ignore_ascii_case("all");
 	let limit = param(&path, "limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(25).clamp(1, 100);
 	let mut after = param(&path, "after").filter(|a| valid_id(a.trim_start_matches("t3_"))).map(|a| STANDARD.encode(a));
 	let mut seen: Vec<String> = Vec::new();
 	let mut children = Vec::new();
 	for _ in 0..ALL_FEED_MAX_PAGES {
-		let mut variables = json_value!({ "sort": sort });
+		let (operation, hash, time_key, mut variables) = if is_all {
+			("AllFeedSdui", ALL_FEED_HASH, "time", json_value!({ "sort": sort }))
+		} else {
+			let variables = json_value!({
+			 "subredditName": sub, "sort": sort, "pageSize": SUBREDDIT_FEED_PAGE_SIZE, "includeSubredditInPosts": false
+			});
+			("SubredditFeedElements", SUBREDDIT_FEED_HASH, "range", variables)
+		};
 		if let Some(time) = time {
-			variables["time"] = time.into();
+			variables[time_key] = time.into();
 		}
 		if let Some(after) = &after {
 			variables["after"] = after.as_str().into();
 		}
 		let body = json_value!({
-		 "operationName": "AllFeedSdui", "variables": variables,
-		 "extensions": { "persistedQuery": { "version": 1, "sha256Hash": ALL_FEED_HASH } }
+		 "operationName": operation, "variables": variables,
+		 "extensions": { "persistedQuery": { "version": 1, "sha256Hash": hash } }
 		});
 		let response = query(&body).await?;
-		let elements = &response["data"]["allV3"]["elements"];
+		let elements = if is_all { &response["data"]["allV3"]["elements"] } else { &response["data"]["postFeed"]["elements"] };
 		let mut tasks = Vec::new();
 		for node in elements["edges"].as_array().into_iter().flatten().map(|edge| &edge["node"]) {
-			let Some(id) = node["groupId"].as_str() else { continue };
+			let Some(id) = node["groupId"].as_str().or(node["postInfo"]["id"].as_str()).or(node["id"].as_str()) else {
+				continue;
+			};
 			let is_post = id.strip_prefix("t3_").is_some_and(valid_id);
 			if is_post && node["adPayload"].is_null() && !seen.iter().any(|i| i == id) {
 				seen.push(id.to_owned());
@@ -524,10 +550,16 @@ mod tests {
 
 	#[test]
 	fn all_feed_paths_map_to_graphql_sorts() {
-		assert!(is_all("/r/all/hot.json?&raw_json=1"));
-		assert!(is_all("/r/All.json"));
-		assert!(!is_all("/r/allthingsrust/hot.json"));
-		assert!(!is_all("/r/all+rust/hot.json"));
+		assert!(is_feed("/r/all/hot.json?&raw_json=1"));
+		assert!(is_feed("/r/All.json"));
+		assert!(!is_feed("/r/allthingsrust/hot.json"));
+		assert!(!is_feed("/r/all+rust/hot.json"));
+		assert!(is_feed("/r/AskReddit/new.json?sort=new&limit=100"));
+		assert!(is_feed("/r/Personal_Finance/rising.json"));
+		assert!(!is_feed("/r/AskReddit/hot.json"));
+		assert!(!is_feed("/r/AskReddit.json"));
+		assert!(!is_feed("/r/Charity%2Bnonprofit/new.json"));
+		assert!(!is_feed("/r/AskReddit/comments/abc/new.json"));
 		assert_eq!(feed_sort("/r/all/hot.json?&raw_json=1").unwrap(), ("HOT", None));
 		assert_eq!(feed_sort("/r/all.json").unwrap(), ("HOT", None));
 		assert_eq!(feed_sort("/r/all/top.json?t=week").unwrap(), ("TOP", Some("WEEK")));
