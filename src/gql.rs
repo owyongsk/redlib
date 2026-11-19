@@ -120,7 +120,13 @@ pub async fn feed(path: String) -> Result<Value, String> {
 			let is_post = id.strip_prefix("t3_").is_some_and(valid_id);
 			if is_post && node["adPayload"].is_null() && !seen.iter().any(|i| i == id) {
 				seen.push(id.to_owned());
-				tasks.push(tokio::spawn(json(format!("/by_id/{id}.json?raw_json=1"), false)));
+				// Subreddit feeds hold the whole post. Fetching each one, as r/all
+				// needs, gets the instance blocked at scanning volumes.
+				if is_all {
+					tasks.push(tokio::spawn(json(format!("/by_id/{id}.json?raw_json=1"), false)));
+				} else {
+					children.push(feed_post(node));
+				}
 			}
 		}
 		for task in tasks {
@@ -400,6 +406,39 @@ fn item(tree: &Value, post_id: &str) -> Option<(u64, Value)> {
 			}
 		}),
 	))
+}
+
+/// Converts a SubredditPost from a GraphQL feed to a post of the JSON API.
+/// Galleries and videos are shown as links to the post.
+fn feed_post(node: &Value) -> Value {
+	let id = node["id"].as_str().unwrap_or_default();
+	let permalink = node["permalink"].as_str().unwrap_or_default();
+	let content = &node["content"];
+	let richtext: Value = content["richtext"].as_str().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_default();
+	let media: Value = content["richtextMedia"].as_str().and_then(|m| serde_json::from_str(m).ok()).unwrap_or_default();
+	let selftext_html = if richtext["document"].is_array() {
+		render(&richtext["document"], &media)
+	} else {
+		content["markdown"].as_str().filter(|m| !m.is_empty()).map(|m| format!("<p>{}</p>", htmlescape::encode_minimal(m))).unwrap_or_default()
+	};
+	let flair = &node["flair"];
+	json_value!({ "kind": "t3", "data": {
+	 "id": id.trim_start_matches("t3_"), "name": id,
+	 "title": node["title"], "permalink": permalink, "url": node["url"], "domain": node["domain"],
+	 "subreddit": permalink.split('/').nth(2).unwrap_or_default(),
+	 "author": node["authorInfo"]["name"].as_str().unwrap_or("[deleted]"),
+	 "distinguished": node["distinguishedAs"].as_str().map(str::to_lowercase),
+	 "created_utc": timestamp(&node["createdAt"]).unwrap_or_default(),
+	 "score": node["score"], "upvote_ratio": node["upvoteRatio"], "num_comments": node["commentCount"],
+	 "hide_score": node["isScoreHidden"], "stickied": node["isStickied"], "over_18": node["isNsfw"], "spoiler": node["isSpoiler"],
+	 "is_self": node["isSelfPost"], "post_hint": node["postHint"].as_str().map(str::to_lowercase),
+	 "is_reddit_media_domain": node["domain"] == "i.redd.it",
+	 "selftext_html": selftext_html,
+	 "thumbnail": node["thumbnail"]["url"],
+	 "link_flair_type": "text", "link_flair_text": flair["text"],
+	 "link_flair_background_color": flair["template"]["backgroundColor"],
+	 "link_flair_text_color": if flair["textColor"] == "DARK" { "dark" } else { "light" },
+	}})
 }
 
 fn timestamp(value: &Value) -> Option<f64> {
@@ -709,6 +748,27 @@ mod tests {
 			assert!(url_attr(Some(url)).is_empty(), "{url}");
 		}
 		assert_eq!(url_attr(Some("/r/rust?a=1&b=2")), "/r/rust?a=1&amp;b=2");
+	}
+
+	#[test]
+	fn feed_posts_become_json_api_posts() {
+		let node = json_value!({
+		 "id": "t3_abc", "title": "Where to donate?", "permalink": "/r/Charity/comments/abc/where_to_donate/",
+		 "url": "https://www.reddit.com/r/Charity/comments/abc/where_to_donate/", "domain": "self.Charity",
+		 "authorInfo": { "name": "someone" }, "createdAt": "2026-11-19T02:17:51.147000+0000",
+		 "score": 3, "upvoteRatio": 0.9, "commentCount": 2, "isSelfPost": true, "postHint": "SELF", "isStickied": false,
+		 "content": { "markdown": "Hi", "richtext": "{\"document\":[{\"e\":\"par\",\"c\":[{\"e\":\"text\",\"t\":\"Hi\"}]}]}", "richtextMedia": "[]" },
+		 "flair": { "text": "Question", "textColor": "DARK", "template": { "backgroundColor": "#fff" } }
+		});
+		let data = &feed_post(&node)["data"];
+		assert_eq!(data["id"], "abc");
+		assert_eq!(data["name"], "t3_abc");
+		assert_eq!(data["subreddit"], "Charity");
+		assert_eq!(data["author"], "someone");
+		assert_eq!(data["created_utc"], 1795054671.0);
+		assert_eq!(data["post_hint"], "self");
+		assert_eq!(data["selftext_html"], "<p>Hi</p>");
+		assert_eq!(data["link_flair_text_color"], "dark");
 	}
 
 	#[test]
